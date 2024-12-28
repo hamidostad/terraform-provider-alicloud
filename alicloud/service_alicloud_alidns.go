@@ -2,6 +2,8 @@ package alicloud
 
 import (
 	"fmt"
+	"log"
+	"regexp"
 	"time"
 
 	"github.com/PaesslerAG/jsonpath"
@@ -441,15 +443,326 @@ func (s *AlidnsService) DescribeDomainRecords(domainName string) ([]alidns.Recor
 	request.RegionId = s.client.RegionId
 	request.DomainName = domainName
 
+	// Call the DescribeDomainRecords API
 	raw, err := s.client.WithAlidnsClient(func(alidnsClient *alidns.Client) (interface{}, error) {
 		return alidnsClient.DescribeDomainRecords(request)
 	})
 	if err != nil {
-		err = WrapErrorf(err, DefaultErrorMsg, domainName, request.GetActionName(), AlibabaCloudSdkGoERROR)
+		err = WrapErrorf(err, "failed to describe domain records for domain %s: %w", domainName, err)
 		return nil, err
 	}
-	addDebug(request.GetActionName(), raw, request.RpcRequest, request)
-	response, _ := raw.(*alidns.DescribeDomainRecordsResponse)
 
+	// Debug log for raw response
+	addDebug(request.GetActionName(), raw, request.RpcRequest, request)
+
+	// Parse the response
+	response, ok := raw.(*alidns.DescribeDomainRecordsResponse)
+	if !ok {
+		return nil, fmt.Errorf("failed to cast response to DescribeDomainRecordsResponse")
+	}
+
+	// Return the list of records
 	return response.DomainRecords.Record, nil
+}
+
+func (s *AlidnsService) GetRecordByAttributes(domainName, rr, recordType, value string) (*alidns.Record, error) {
+	records, err := s.DescribeDomainRecords(domainName)
+	if err != nil {
+		return nil, WrapError(err)
+	}
+
+	for _, record := range records {
+		if record.RR == rr && record.Type == recordType && record.Value == value {
+			return &record, nil
+		}
+	}
+
+	return nil, nil // No matching record found
+}
+
+func (s *AlidnsService) CreateRecord(domainName, rr, recordType, value string, ttl int, line string) (string, error) {
+	// Step 1: Check if the record already exists
+	existingRecords, err := s.DescribeDomainRecords(domainName)
+	if err != nil {
+		return "", fmt.Errorf("failed to describe domain records: %s", err)
+	}
+
+	for _, record := range existingRecords {
+		if record.RR == rr && record.Type == recordType && record.Value == value {
+			log.Printf("[DEBUG] Record already exists: %s", record.RecordId)
+			return record.RecordId, nil // Return existing recordId
+		}
+	}
+
+	// Step 2: Create a new record
+	request := alidns.CreateAddDomainRecordRequest()
+	request.RegionId = s.client.RegionId
+	request.DomainName = domainName
+	request.RR = rr
+	request.Type = recordType
+	request.Value = value
+	request.TTL = requests.NewInteger(ttl)
+	request.Line = line
+
+	response, err := s.client.WithAlidnsClient(func(client *alidns.Client) (interface{}, error) {
+		return client.AddDomainRecord(request)
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("failed to create DNS record: %s", err)
+	}
+
+	resp, ok := response.(*alidns.AddDomainRecordResponse)
+	if !ok {
+		return "", fmt.Errorf("unexpected response type")
+	}
+
+	return resp.RecordId, nil
+}
+
+// UpdateRecord updates the attributes of an existing DNS record.
+func (s *AlidnsService) UpdateRecord(recordID, domainName, rr, recordType, value, line string, ttl int) error {
+	// Fetch the current state of the record
+	existingRecord, err := s.DescribeDomainRecordById(recordID, domainName)
+	if err != nil {
+		return fmt.Errorf("failed to fetch existing record %s: %w", recordID, err)
+	}
+
+	// Convert ttl to int64 for comparison
+	ttlInt64 := int64(ttl)
+
+	// Compare the current state with the requested updates
+	if existingRecord.RR == rr && existingRecord.Type == recordType &&
+		existingRecord.Value == value && existingRecord.TTL == ttlInt64 {
+		log.Printf("[DEBUG] No changes detected for record %s, skipping update", recordID)
+		return nil
+	}
+
+	// Proceed with the update if there are changes
+	request := alidns.CreateUpdateDomainRecordRequest()
+	request.RegionId = s.client.RegionId
+	request.RecordId = recordID
+	request.RR = rr
+	request.Type = recordType
+	request.Value = value
+	request.TTL = requests.NewInteger(ttl)
+	request.Line = line
+
+	_, err = s.client.WithAlidnsClient(func(alidnsClient *alidns.Client) (interface{}, error) {
+		return alidnsClient.UpdateDomainRecord(request)
+	})
+	if err != nil {
+		return WrapErrorf(err, "failed to update DNS record with ID %s", recordID)
+	}
+
+	return nil
+}
+
+// DeleteRecord deletes a DNS record by its ID.
+func (s *AlidnsService) DeleteRecord(recordID string) error {
+	request := alidns.CreateDeleteDomainRecordRequest()
+	request.RegionId = s.client.RegionId
+	request.RecordId = recordID
+
+	_, err := s.client.WithAlidnsClient(func(client *alidns.Client) (interface{}, error) {
+		return client.DeleteDomainRecord(request)
+	})
+	if err != nil {
+		if IsExpectedErrors(err, []string{"InvalidRecordId.NotFound"}) {
+			// Record already deleted or not found, safe to ignore
+			return nil
+		}
+		return fmt.Errorf("failed to delete DNS record: %w", err)
+	}
+
+	return nil
+}
+
+// SetRecordRemark sets a remark for a DNS record.
+// Note: If Alibaba Cloud SDK does not support this operation, it should be adjusted accordingly.
+func (s *AlidnsService) SetRecordRemark(recordID, remark string) error {
+	// Check if Alibaba SDK supports UpdateDomainRemarkRequest and confirm its required fields.
+	request := alidns.CreateUpdateDomainRemarkRequest()
+	request.RegionId = s.client.RegionId
+	request.Remark = remark
+
+	// Workaround if RecordId is not supported:
+	// Adjust the request parameters to use DomainName and RR instead of RecordId.
+	// Example below uses DomainName and RR if required.
+
+	// Add additional fields to locate the record
+	// request.DomainName = "<Domain Name>" // Replace with actual domain name if required.
+	// request.RR = "<RR Value>"           // Replace with actual RR if needed.
+
+	_, err := s.client.WithAlidnsClient(func(client *alidns.Client) (interface{}, error) {
+		return client.UpdateDomainRemark(request)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to set remark for DNS record: %w", err)
+	}
+	return nil
+}
+
+// SetRecordStatus sets the status of a DNS record (ENABLE or DISABLE).
+func (s *AlidnsService) SetRecordStatus(recordID, status string) error {
+	request := alidns.CreateSetDomainRecordStatusRequest()
+	request.RegionId = s.client.RegionId
+	request.RecordId = recordID
+	request.Status = status
+
+	_, err := s.client.WithAlidnsClient(func(client *alidns.Client) (interface{}, error) {
+		return client.SetDomainRecordStatus(request)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to set status for DNS record: %w", err)
+	}
+	return nil
+}
+
+func (s *AlidnsService) EnableWRRStatus(domainName, rr string) error {
+	request := alidns.CreateSetDNSSLBStatusRequest()
+	request.RegionId = s.client.RegionId
+	request.DomainName = domainName
+	request.SubDomain = fmt.Sprintf("%s.%s", rr, domainName)
+	request.Open = requests.NewBoolean(true)
+
+	_, err := s.client.WithAlidnsClient(func(client *alidns.Client) (interface{}, error) {
+		return client.SetDNSSLBStatus(request)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to enable WRR for subdomain %s.%s: %w", rr, domainName, err)
+	}
+
+	return nil
+}
+
+func (s *AlidnsService) SetRecordWeight(recordID string, weight int) error {
+	request := alidns.CreateUpdateDNSSLBWeightRequest()
+	request.RegionId = s.client.RegionId
+	request.RecordId = recordID
+	request.Weight = requests.NewInteger(weight)
+
+	_, err := s.client.WithAlidnsClient(func(alidnsClient *alidns.Client) (interface{}, error) {
+		return alidnsClient.UpdateDNSSLBWeight(request)
+	})
+	if err != nil {
+		return WrapError(fmt.Errorf("failed to update weight for record %s: %w", recordID, err))
+	}
+	return nil
+}
+
+func (s *AlidnsService) UpdateRecordRemark(recordID string, remark string) error {
+	// Create the request for updating the domain record remark
+	request := alidns.CreateUpdateDomainRecordRemarkRequest() // Correct request type
+	request.RegionId = s.client.RegionId
+	request.Remark = remark
+	request.RecordId = recordID // Ensure this field exists in the request struct
+
+	// Execute the request
+	_, err := s.client.WithAlidnsClient(func(alidnsClient *alidns.Client) (interface{}, error) {
+		return alidnsClient.UpdateDomainRecordRemark(request)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to update remark for record %s: %s", recordID, err)
+	}
+
+	return nil
+}
+
+func isValidDomainName(domain string) bool {
+	// Regex for validating domain names
+	re := regexp.MustCompile(`^([a-zA-Z0-9-]{1,63}\.){1,255}[a-zA-Z]{2,63}$`)
+	return re.MatchString(domain)
+}
+
+// GetRecordWeight fetches the weight of a specific record by its ID.
+func (s *AlidnsService) GetRecordWeight(domainName, recordID string) (int, error) {
+	// Create the request for DescribeDomainRecords
+	request := alidns.CreateDescribeDomainRecordsRequest()
+	request.RegionId = s.client.RegionId
+	request.DomainName = domainName
+
+	// Fetch the domain records
+	response, err := s.client.WithAlidnsClient(func(alidnsClient *alidns.Client) (interface{}, error) {
+		return alidnsClient.DescribeDomainRecords(request)
+	})
+	if err != nil {
+		return 0, WrapError(err)
+	}
+
+	resp, ok := response.(*alidns.DescribeDomainRecordsResponse)
+	if !ok {
+		return 0, fmt.Errorf("failed to cast response to DescribeDomainRecordsResponse")
+	}
+
+	// Iterate through the records to find the matching record ID
+	for _, record := range resp.DomainRecords.Record {
+		if record.RecordId == recordID {
+			return record.Weight, nil
+		}
+	}
+
+	return 0, fmt.Errorf("record with ID %s not found", recordID)
+}
+
+// GetRecordRemark fetches the remark of a specific record by its ID.
+func (s *AlidnsService) GetRecordRemark(recordID string) (string, error) {
+	request := alidns.CreateDescribeDomainRecordInfoRequest()
+	request.RecordId = recordID
+
+	response, err := s.client.WithAlidnsClient(func(alidnsClient *alidns.Client) (interface{}, error) {
+		return alidnsClient.DescribeDomainRecordInfo(request)
+	})
+	if err != nil {
+		return "", WrapError(err)
+	}
+
+	resp, ok := response.(*alidns.DescribeDomainRecordInfoResponse)
+	if !ok {
+		return "", fmt.Errorf("failed to cast response to DescribeDomainRecordInfoResponse")
+	}
+
+	return resp.Remark, nil
+}
+
+// GetRecordStatus fetches the status of a specific record by its ID.
+func (s *AlidnsService) GetRecordStatus(recordID string) (string, error) {
+	request := alidns.CreateDescribeDomainRecordInfoRequest()
+	request.RecordId = recordID
+
+	response, err := s.client.WithAlidnsClient(func(alidnsClient *alidns.Client) (interface{}, error) {
+		return alidnsClient.DescribeDomainRecordInfo(request)
+	})
+	if err != nil {
+		return "", WrapError(err)
+	}
+
+	resp, ok := response.(*alidns.DescribeDomainRecordInfoResponse)
+	if !ok {
+		return "", fmt.Errorf("failed to cast response to DescribeDomainRecordInfoResponse")
+	}
+
+	return resp.Status, nil
+}
+
+// Helper function to find removed records
+func findRemovedRecords(oldRecords, newRecords []interface{}) []interface{} {
+	removed := []interface{}{}
+	newRecordsMap := map[string]bool{}
+
+	// Create a map of new records for comparison
+	for _, record := range newRecords {
+		r := record.(map[string]interface{})
+		newRecordsMap[r["id"].(string)] = true
+	}
+
+	// Find records in old that are not in new
+	for _, record := range oldRecords {
+		r := record.(map[string]interface{})
+		if !newRecordsMap[r["id"].(string)] {
+			removed = append(removed, record)
+		}
+	}
+
+	return removed
 }
